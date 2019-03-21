@@ -1,0 +1,175 @@
+---
+- name: upgrade aerospike
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    wait_for_migs: "yes" #it is not necessary to wipe data/wait for migrations in a replicated storage-backed namespace https://discuss.aerospike.com/t/general-questions-on-rolling-restart/5130
+    desired_asd_version: "4.5.1.5"
+    linux_updates: "yes"
+    retry_limit: 300
+    retry_delay: 1
+    check_for_migs: true
+    min_cluster_size: 3
+    fail_on_cluster_change: true
+    quiesce: true
+    aerospike_package_path: "/opt"
+  tasks:
+    - name: get current version
+      shell: |
+          asd --version | awk '{print $NF}'
+      register: asd_version
+      changed_when: false
+
+    - name: print version
+      debug:
+          msg: 'found version {{ asd_version.stdout }}'
+
+    - name: install aerospike python module
+      pip:
+        name: aerospike
+
+    - name: upgrade
+      when: asd_version.stdout is version(desired_asd_version, '<')
+      block:
+        - name: message
+          debug:
+              msg: "Upgrading Aerospike from {{ asd_version.stdout }} to {{ desired_asd_version }}"
+
+        - name: copy package to remote machine
+          copy:
+            src: "aerospike-server-enterprise-{{ desired_asd_version }}-ubuntu16.04.tgz"
+            dest: "{{ aerospike_package_path }}/aerospike-server-enterprise-{{ desired_asd_version }}-ubuntu16.04.tgz"
+
+        - name: Check and or wait for Migrations
+          aerospike_migrations:
+              local_only: False
+              sleep_between_checks: 2
+              tries_limit: 6
+              consecutive_good_checks: 5
+              fail_on_cluster_change: "{{ fail_on_cluster_change }}"
+              min_cluster_size: "{{ min_cluster_size }}"
+          register: migrations_check_pre
+          until: migrations_check_pre is succeeded
+          changed_when: false
+          delay: "{{ retry_delay }}"
+          retries: "{{ retry_limit }}"
+          when: check_for_migs
+
+        - name: quiesce this node
+          when: quiesce
+          shell: |
+            asinfo -v 'quiesce:'
+          register: quiesced
+          failed_when: '"ok" not in quiesced.stdout'
+
+        - name: issue recluster
+          when: quiesced.changed
+          shell: |
+            asadm -e 'asinfo -v "recluster:"'
+          register: recluster
+          failed_when: '"ok" not in recluster.stdout or "rror" in recluster.stdout'
+
+        - name: wait for Migrations
+          aerospike_migrations:
+              local_only: False
+              sleep_between_checks: 2
+              tries_limit: 6
+              consecutive_good_checks: 5
+              fail_on_cluster_change: "{{ fail_on_cluster_change }}"
+              min_cluster_size: "{{ min_cluster_size }}"
+          register: migrations_check_pre
+          until: migrations_check_pre is succeeded
+          changed_when: false
+          delay: "{{ retry_delay }}"
+          retries: "{{ retry_limit }}"
+          when: 'check_for_migs and recluster.changed'
+
+        - name: stop aerospike
+          service:
+            name: aerospike
+            state: stopped
+
+        - name: update
+          include_role:
+            name: linux/update
+          register: update
+          when: linux_updates
+
+        - name: reboot
+          reboot:
+
+        - name: deb specific steps
+          when: ansible_os_family == "Debian"
+          block:
+            - name: extract tgz
+              unarchive:
+                src: "{{ aerospike_package_path }}/aerospike-server-enterprise-{{ desired_asd_version }}-ubuntu16.04.tgz"
+                dest: /root/
+                remote_src: yes
+              changed_when: false
+
+            - name: install aerospike
+              shell: |
+                yes | ./asinstall
+              args:
+                chdir: /root/aerospike-server-enterprise-{{ desired_asd_version }}-ubuntu16.04
+              changed_when: false
+
+
+        - name: el specific steps
+          when: ansible_os_family == "RedHat"
+          block:
+            - name: extract tgz
+              unarchive:
+                src: "{{ aerospike_package_path }}/aerospike-server-enterprise-{{ desired_asd_version }}-el7.tgz"
+                dest: /root/
+                remote_src: yes
+              changed_when: false
+
+            - name: install aerospike
+              shell: |
+                yes | ./asinstall
+              args:
+                chdir: /root/aerospike-server-enterprise-{{ desired_asd_version }}-el7
+              changed_when: false
+
+    - name: start aerospike using systemctl
+      service:
+        name: aerospike
+        state: started
+      register: aerospikesystemd
+
+    - name: aerospike started
+      when: aerospikesystemd.changed
+      block:
+        - name: Aerospike verified running
+          shell: |
+            systemctl status aerospike
+          register: service_aerospike_status
+          changed_when: false
+          failed_when: '"running" not in service_aerospike_status.stdout'
+
+        - name: check status
+          shell: |
+            asinfo -v 'status'
+          changed_when: false
+          register: asinfo_status
+          until: 'asinfo_status.rc == 0 and "ok" in asinfo_status.stdout'
+          delay: 120
+          retries: 180 #wait up to 6 hours for local disk reads
+
+        - name: Check and or wait for Migrations
+          aerospike_migrations:
+              local_only: False
+              sleep_between_checks: 15
+              tries_limit: 5
+              consecutive_good_checks: 3
+              fail_on_cluster_change: "{{ fail_on_cluster_change }}"
+              min_cluster_size: "{{ min_cluster_size }}"
+          register: migrations_check_post
+          until: migrations_check_post is succeeded
+          changed_when: false
+          delay: "{{ retry_delay }}"
+          retries: "{{ retry_limit }}"
+          when: check_for_migs

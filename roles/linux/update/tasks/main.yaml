@@ -1,0 +1,23 @@
+---
+# Because its annoying to have to put this into playbooks, it makes
+#  sense to just use a role for linux apt/yum updates.
+#  To use this, just add "- role: linux/update" under the 'roles:'
+#  section of the playbook.
+  - name: run apt update
+    when: ansible_os_family == "Debian"
+    block:
+    - name: Debian family - update apt cache and run upgrade
+      apt:
+        upgrade: yes
+        update_cache: yes
+        force_apt_get: yes
+      become: true
+
+  - name: RedHat family - yum update
+    when: ansible_os_family == "RedHat"
+    block:
+    - name: yum update
+      yum:
+        name: '*'
+        state: latest
+      become: true
